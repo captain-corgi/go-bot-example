@@ -2,18 +2,20 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"time"
 
 	"gobot.io/x/gobot"
 	"gobot.io/x/gobot/platforms/ble"
 )
 
+const (
+	fiioM5ID    = "40-ED-98-1A-25-E4"
+	macbookID   = "F8-FF-C2-62-D6-6A"
+	macbookName = "KB-20A3KC61J1"
+)
+
 func main() {
-	fmt.Println("Hello bluetooth.")
-	fmt.Println("https://gobot.io/documentation/platforms/ble/")
-	fmt.Println("go get -d -u gobot.io/x/gobot/...")
-	bleAdaptor := ble.NewClientAdaptor(os.Args[1])
+	bleAdaptor := ble.NewClientAdaptor(fiioM5ID)
 	battery := ble.NewBatteryDriver(bleAdaptor)
 
 	work := func() {
