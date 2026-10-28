@@ -74,6 +74,9 @@ func (h *Handler) startTurn(w http.ResponseWriter, flusher http.Flusher, r *http
 		problem.WriteProblem(w, r, http.StatusConflict, TypeSessionBusy, TitleSessionBusy,
 			"Session "+s.ID()+" is currently executing an active turn.")
 		return
+	case errors.Is(err, session.ErrSessionClosed):
+		problem.NotFound(w, r, "Session "+s.ID()+" does not exist.")
+		return
 	case errors.Is(err, session.ErrSessionFaulted):
 		problem.Conflict(w, r, "Session "+s.ID()+" is in the error state; create a new session.")
 		return

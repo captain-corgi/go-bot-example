@@ -24,6 +24,7 @@ type harnessConfig struct {
 	transport []sessiontest.Option
 	store     session.Store
 	grace     time.Duration
+	options   func(*session.Options)
 }
 
 type harness struct {
@@ -38,11 +39,15 @@ type harness struct {
 func newHarness(t *testing.T, cfg harnessConfig) *harness {
 	t.Helper()
 	factory := sessiontest.NewMockFactory(cfg.transport...)
-	manager, err := session.NewManager(session.Options{
+	opts := session.Options{
 		NewTransport:    factory.New,
 		Store:           cfg.store,
 		DisconnectGrace: cfg.grace,
-	})
+	}
+	if cfg.options != nil {
+		cfg.options(&opts)
+	}
+	manager, err := session.NewManager(opts)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}

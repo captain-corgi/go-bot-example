@@ -1,5 +1,6 @@
 // Package api implements the Grok Bot daemon's session HTTP endpoints:
-// session creation/resumption and SSE prompt streaming.
+// session creation/resumption, SSE prompt streaming, turn interruption, and
+// session teardown.
 package api
 
 import (
@@ -36,6 +37,8 @@ func NewHandler(manager session.SessionManager) *Handler {
 func (h *Handler) Register(r Registrar) {
 	r.HandleFunc("POST /sessions", h.createSession)
 	r.HandleFunc("POST /sessions/{id}/prompts", h.submitPrompt)
+	r.HandleFunc("POST /sessions/{id}/interrupt", h.interruptSession)
+	r.HandleFunc("DELETE /sessions/{id}", h.closeSession)
 }
 
 type createSessionResponse struct {

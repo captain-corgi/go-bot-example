@@ -70,7 +70,7 @@ func TestListenLoopbackBindsLoopback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListenLoopback: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
 	if !ok {
@@ -89,7 +89,7 @@ func TestListenLoopbackFailsFast(t *testing.T) {
 		t.Run(addr, func(t *testing.T) {
 			ln, err := ListenLoopback(context.Background(), addr)
 			if err == nil {
-				ln.Close()
+				_ = ln.Close()
 				t.Fatal("expected error, got listener")
 			}
 			if ln != nil {
@@ -104,10 +104,10 @@ func TestListenLoopbackPortInUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListenLoopback: %v", err)
 	}
-	defer first.Close()
+	defer func() { _ = first.Close() }()
 
 	if ln, err := ListenLoopback(context.Background(), first.Addr().String()); err == nil {
-		ln.Close()
+		_ = ln.Close()
 		t.Fatal("expected error binding an in-use port")
 	}
 }

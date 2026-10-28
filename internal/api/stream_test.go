@@ -23,7 +23,7 @@ func (h *harness) createLive(t *testing.T, body string) createResponse {
 	if err != nil {
 		t.Fatalf("POST /sessions: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("POST /sessions status = %d, body %s", resp.StatusCode, b)
