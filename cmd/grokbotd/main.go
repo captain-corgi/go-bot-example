@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -12,7 +13,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/captain-corgi/go-bot-example/internal/api"
 	"github.com/captain-corgi/go-bot-example/internal/server"
+	"github.com/captain-corgi/go-bot-example/internal/session"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -31,7 +34,14 @@ func run(addr string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv, err := server.New(ctx, addr, server.NewRouter())
+	manager, err := session.NewManager(session.Options{NewTransport: newAgentTransport})
+	if err != nil {
+		return err
+	}
+	router := server.NewRouter()
+	api.NewHandler(manager).Register(router)
+
+	srv, err := server.New(ctx, addr, router)
 	if err != nil {
 		return err
 	}
@@ -48,8 +58,11 @@ func run(addr string) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+	// Tearing sessions down first ends in-flight SSE streams so the HTTP
+	// server can drain its connections.
+	sessionErr := manager.Shutdown(shutdownCtx)
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return err
+		return errors.Join(err, sessionErr)
 	}
-	return <-errCh
+	return errors.Join(<-errCh, sessionErr)
 }
