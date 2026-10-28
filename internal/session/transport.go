@@ -19,6 +19,9 @@ const (
 	StateRunning     SessionState = "running"
 	StateInterrupted SessionState = "interrupted"
 	StateError       SessionState = "error"
+	// StateClosed marks a session torn down via CloseSession. Closed sessions
+	// are no longer registered and reject every operation.
+	StateClosed SessionState = "closed"
 )
 
 // Message is one entry of a session's persisted conversation history.
@@ -101,7 +104,8 @@ type SDKEvent struct {
 }
 
 // Transport is a dedicated, bidirectional agent subprocess bound 1:1 to a
-// session. Production implementations wrap the claude-agent-sdk-go client;
+// session. Production implementations wrap the claude-agent-sdk-go client and
+// spawn the subprocess in its own OS process group (see ProcessGroupAttr);
 // tests use a deterministic fake.
 type Transport interface {
 	// Start spawns or reattaches the agent subprocess. ctx bounds the
@@ -111,7 +115,19 @@ type Transport interface {
 	// The transport closes the channel when the turn ends. Senders must select
 	// on ctx.Done() so a cancelled turn never blocks the transport.
 	SendPrompt(ctx context.Context, prompt string) (<-chan SDKEvent, error)
-	// Close terminates the agent subprocess and releases its descriptors.
+	// Interrupt asks the agent to halt its in-flight turn while keeping the
+	// subprocess alive. The transport acknowledges the halt by closing the
+	// turn's event channel. It must not block beyond ctx.
+	Interrupt(ctx context.Context) error
+	// Done delivers the subprocess exit error (nil for a clean exit) once the
+	// subprocess exits, then is closed. A transport without a subprocess may
+	// return nil, which disables fault monitoring.
+	Done() <-chan error
+	// PGID returns the OS process group ID of the agent subprocess, or 0 when
+	// the transport has no dedicated process group to signal.
+	PGID() int
+	// Close terminates the agent subprocess and its process group, reaps it
+	// so no zombie remains, and releases its descriptors.
 	Close() error
 }
 

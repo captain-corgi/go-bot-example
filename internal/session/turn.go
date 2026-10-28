@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/captain-corgi/go-bot-example/internal/sse"
 )
@@ -16,13 +17,21 @@ var (
 	// ErrSessionFaulted is returned when a prompt is submitted to a session
 	// in the error state.
 	ErrSessionFaulted = errors.New("session: session is in error state")
+	// ErrSessionClosed is returned for operations on a torn-down session.
+	ErrSessionClosed = errors.New("session: session is closed")
 )
+
+// exitProbeWindow is how long a turn whose event stream ended without
+// completing waits for the fault monitor to attribute the end to a
+// subprocess exit before reporting it as an incomplete turn.
+const exitProbeWindow = 100 * time.Millisecond
 
 // Stream-level error codes emitted by the session itself.
 const (
 	CodeInvalidEvent   = "invalid_event"
 	CodeTurnIncomplete = "turn_incomplete"
 	CodePersistFailed  = "persist_failed"
+	CodeSubprocessExit = "subprocess_exit"
 )
 
 type turnOutcome int
@@ -44,8 +53,11 @@ const (
 func (s *Session) StartTurn(prompt string) (turn *Turn, startSeq uint64, err error) {
 	turnCtx, _, ok := s.TryBeginTurn(s.lifetime)
 	if !ok {
-		if s.State() == StateError {
+		switch s.State() {
+		case StateError:
 			return nil, 0, ErrSessionFaulted
+		case StateClosed:
+			return nil, 0, ErrSessionClosed
 		}
 		return nil, 0, ErrTurnInProgress
 	}
@@ -64,15 +76,17 @@ func (s *Session) StartTurn(prompt string) (turn *Turn, startSeq uint64, err err
 		return nil, 0, fmt.Errorf("session %s: append running frame: %w", s.id, err)
 	}
 
-	go s.runTurn(turnCtx, events, prompt)
+	go s.runTurn(turnCtx, turn, events, prompt)
 	return turn, frame.ID - 1, nil
 }
 
 // runTurn pumps transport events into the replay buffer until the turn ends,
-// persists the exchange, and appends the terminal frames.
-func (s *Session) runTurn(ctx context.Context, events <-chan SDKEvent, prompt string) {
+// persists the exchange, and appends the terminal frames. A turn already
+// ended by a subprocess fault or session teardown is left as is.
+func (s *Session) runTurn(ctx context.Context, t *Turn, events <-chan SDKEvent, prompt string) {
 	var reply strings.Builder
 	outcome, terminal := s.consume(ctx, events, &reply)
+	go s.awaitHalt(t, events)
 
 	var final []SDKEvent
 	if err := s.recordExchange(prompt, reply.String()); err != nil {
@@ -81,14 +95,46 @@ func (s *Session) runTurn(ctx context.Context, events <-chan SDKEvent, prompt st
 
 	switch outcome {
 	case outcomeDone:
-		s.finishTurn(StateIdle, append(final, terminal, stateEvent(StateIdle))...)
+		s.finishTurn(t, StateIdle, append(final, terminal, stateEvent(StateIdle))...)
 	case outcomeFatal:
-		s.finishTurn(StateError, append(final, terminal, stateEvent(StateError))...)
+		s.finishTurn(t, StateError, append(final, terminal, stateEvent(StateError))...)
 	case outcomeCancelled:
-		s.finishTurn(StateIdle, append(final, stateEvent(StateInterrupted), stateEvent(StateIdle))...)
+		s.finishTurn(t, StateIdle, append(final, stateEvent(StateInterrupted), stateEvent(StateIdle))...)
 	default:
+		if s.waitExited(exitProbeWindow) {
+			// The subprocess died; the fault monitor reports it and ends the turn.
+			return
+		}
 		incomplete := StreamError(CodeTurnIncomplete, "agent transport ended the turn without completing it", true)
-		s.finishTurn(StateError, append(final, incomplete, stateEvent(StateError))...)
+		s.finishTurn(t, StateError, append(final, incomplete, stateEvent(StateError))...)
+	}
+}
+
+// awaitHalt drains events the session no longer consumes and marks t halted
+// once the transport closes the channel, or when the session is torn down.
+func (s *Session) awaitHalt(t *Turn, events <-chan SDKEvent) {
+	defer t.markHalted()
+	for {
+		select {
+		case _, ok := <-events:
+			if !ok {
+				return
+			}
+		case <-s.lifetime.Done():
+			return
+		}
+	}
+}
+
+// waitExited reports whether the subprocess exits within d.
+func (s *Session) waitExited(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-s.exited:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 

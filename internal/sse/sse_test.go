@@ -265,3 +265,40 @@ func TestConcurrentOperationsRaceFree(t *testing.T) {
 		}
 	}
 }
+
+func TestPurgeDropsFramesAndKeepsSequence(t *testing.T) {
+	buf := NewEventRingBuffer(4)
+	for i := 0; i < 3; i++ {
+		if _, err := buf.Append(EventAssistantChunk, AssistantChunkPayload{Delta: strconv.Itoa(i)}); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+	var fired atomic.Bool
+	buf.StartDisconnectGrace(10*time.Millisecond, func() { fired.Store(true) })
+	wait := buf.Wait()
+
+	buf.Purge()
+
+	select {
+	case <-wait:
+	default:
+		t.Fatal("Purge did not wake waiters")
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("Len after Purge = %d, want 0", buf.Len())
+	}
+	if frames, ok := buf.ReplayAfter(0); len(frames) != 0 || !ok {
+		t.Fatalf("ReplayAfter(0) = %d frames, inWindow %v", len(frames), ok)
+	}
+	if buf.LastSeq() != 3 {
+		t.Fatalf("LastSeq after Purge = %d, want 3", buf.LastSeq())
+	}
+	f, err := buf.Append(EventDone, DonePayload{})
+	if err != nil || f.ID != 4 {
+		t.Fatalf("Append after Purge = id %d, err %v; want id 4", f.ID, err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if fired.Load() {
+		t.Fatal("grace timer fired after Purge")
+	}
+}

@@ -15,6 +15,20 @@ type Turn struct {
 	cancel      context.CancelFunc
 	subscribers int    // guarded by the owning Session's mu
 	endSeq      uint64 // written before done is closed
+
+	// halted is closed once the transport has acknowledged the end of the
+	// turn by closing its event channel (or no event channel exists).
+	halted    chan struct{}
+	haltOnce  sync.Once
+	interrupt sync.Once
+}
+
+func newTurn(cancel context.CancelFunc) *Turn {
+	return &Turn{done: make(chan struct{}), halted: make(chan struct{}), cancel: cancel}
+}
+
+func (t *Turn) markHalted() {
+	t.haltOnce.Do(func() { close(t.halted) })
 }
 
 // Done is closed once the turn has completed and its final frames have been
@@ -37,6 +51,11 @@ type Session struct {
 	store     Store
 	graceTTL  time.Duration
 	now       func() time.Time
+	interrupt interruptConfig
+
+	// exited is closed by the fault monitor once the transport's subprocess
+	// has exited.
+	exited chan struct{}
 
 	// lifetime is the session-scoped context; turns derive from it so they
 	// are decoupled from any single HTTP request.
@@ -84,35 +103,59 @@ func (s *Session) TryBeginTurn(ctx context.Context) (turnCtx context.Context, ca
 		return nil, nil, false
 	}
 	turnCtx, cancel = context.WithCancel(ctx)
-	s.turn = &Turn{done: make(chan struct{}), cancel: cancel}
+	s.turn = newTurn(cancel)
 	s.state = StateRunning
 	return turnCtx, cancel, true
 }
 
 // CompleteTurn ends the active turn, if any, and transitions the session to
-// nextState.
+// nextState. It is a no-op once the session is closed.
 func (s *Session) CompleteTurn(nextState SessionState) {
-	s.finishTurn(nextState)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state == StateClosed {
+		return
+	}
+	if t := s.turn; t != nil {
+		s.releaseTurnLocked(t, nextState)
+		t.markHalted()
+		return
+	}
+	s.state = nextState
 }
 
 // finishTurn appends the final frames, transitions to nextState, and releases
-// the active turn in one critical section so a client that observes the final
-// frame can immediately start the next turn.
-func (s *Session) finishTurn(nextState SessionState, final ...SDKEvent) {
+// t in one critical section so a client that observes the final frame can
+// immediately start the next turn. It reports false, appending nothing, when
+// t is no longer the active turn because a fault or teardown already ended it.
+func (s *Session) finishTurn(t *Turn, nextState SessionState, final ...SDKEvent) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, ev := range final {
-		// Final frames are built internally from well-formed payloads.
+	if s.turn != t {
+		return false
+	}
+	s.appendLocked(final...)
+	s.releaseTurnLocked(t, nextState)
+	return true
+}
+
+// releaseTurnLocked transitions to nextState and ends t, waking every stream
+// following it. s.mu must be held and t must be the active turn.
+func (s *Session) releaseTurnLocked(t *Turn, nextState SessionState) {
+	s.state = nextState
+	s.turn = nil
+	t.endSeq = s.events.LastSeq()
+	t.cancel()
+	close(t.done)
+	s.events.CancelDisconnectGrace()
+}
+
+// appendLocked appends session-built frames to the replay buffer.
+func (s *Session) appendLocked(frames ...SDKEvent) {
+	for _, ev := range frames {
+		// Session frames are built internally from well-formed payloads.
 		_, _ = s.events.Append(ev.Type, ev.Payload)
 	}
-	s.state = nextState
-	if t := s.turn; t != nil {
-		s.turn = nil
-		t.endSeq = s.events.LastSeq()
-		t.cancel()
-		close(t.done)
-	}
-	s.events.CancelDisconnectGrace()
 }
 
 // Attach registers an SSE subscriber on the active turn and cancels any

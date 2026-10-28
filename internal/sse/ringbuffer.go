@@ -110,6 +110,27 @@ func (b *EventRingBuffer) Wait() <-chan struct{} {
 	return b.changed
 }
 
+// Purge drops every retained frame, cancels any pending grace timer, and
+// wakes every waiter. Sequence numbering continues from LastSeq so IDs are
+// never reused. It is used when the owning session is torn down.
+func (b *EventRingBuffer) Purge() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	clear(b.frames)
+	b.start, b.count = 0, 0
+	b.stopGraceLocked()
+	close(b.changed)
+	b.changed = make(chan struct{})
+}
+
+// Len returns the number of retained frames.
+func (b *EventRingBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.count
+}
+
 // StartDisconnectGrace arms the disconnect grace timer: onExpire runs after
 // ttl unless CancelDisconnectGrace is called first. Arming replaces any
 // previously pending timer. onExpire runs without the buffer lock held.

@@ -53,6 +53,28 @@ func WithSendError(err error) Option {
 	return func(m *MockTransport) { m.sendErr = err }
 }
 
+// WithPGID makes PGID report pgid, enabling process group escalation.
+func WithPGID(pgid int) Option {
+	return func(m *MockTransport) { m.pgid = pgid }
+}
+
+// WithIgnoredInterrupts makes Interrupt leave open turns running, simulating
+// an agent that does not honor the SDK interrupt and must be escalated to
+// with SIGINT.
+func WithIgnoredInterrupts() Option {
+	return func(m *MockTransport) { m.ignoreInterrupts = true }
+}
+
+// WithInterruptError makes Interrupt fail with err (open turns stay running).
+func WithInterruptError(err error) Option {
+	return func(m *MockTransport) { m.interruptErr = err }
+}
+
+// WithCloseError makes Close fail with err after terminating the transport.
+func WithCloseError(err error) Option {
+	return func(m *MockTransport) { m.closeErr = err }
+}
+
 // MockFactory creates MockTransports and records every one it creates.
 type MockFactory struct {
 	opts []Option
@@ -68,7 +90,7 @@ func NewMockFactory(opts ...Option) *MockFactory {
 
 // New creates and records a MockTransport. It satisfies session.TransportFactory.
 func (f *MockFactory) New() session.Transport {
-	m := &MockTransport{turns: make(chan *MockTurn, 16)}
+	m := &MockTransport{turns: make(chan *MockTurn, 16), done: make(chan error, 1)}
 	for _, opt := range f.opts {
 		opt(m)
 	}
@@ -98,17 +120,25 @@ func (f *MockFactory) Last() *MockTransport {
 // MockTransport is a deterministic in-memory session.Transport. It never
 // spawns processes or contacts model endpoints.
 type MockTransport struct {
-	script   Script
-	startErr error
-	sendErr  error
-	turns    chan *MockTurn
+	script           Script
+	startErr         error
+	sendErr          error
+	interruptErr     error
+	closeErr         error
+	pgid             int
+	ignoreInterrupts bool
+	turns            chan *MockTurn
+	done             chan error
 
-	mu         sync.Mutex
-	started    bool
-	startCfg   session.SessionConfig
-	startCtx   context.Context
-	prompts    []string
-	closeCount int
+	mu             sync.Mutex
+	started        bool
+	exited         bool
+	startCfg       session.SessionConfig
+	startCtx       context.Context
+	prompts        []string
+	open           []*MockTurn
+	closeCount     int
+	interruptCount int
 }
 
 var _ session.Transport = (*MockTransport)(nil)
@@ -140,7 +170,10 @@ func (m *MockTransport) SendPrompt(ctx context.Context, prompt string) (<-chan s
 	m.prompts = append(m.prompts, prompt)
 	m.mu.Unlock()
 
-	turn := &MockTurn{Prompt: prompt, ctx: ctx, events: make(chan session.SDKEvent)}
+	turn := &MockTurn{Prompt: prompt, ctx: ctx, events: make(chan session.SDKEvent), stop: make(chan struct{})}
+	m.mu.Lock()
+	m.open = append(m.open, turn)
+	m.mu.Unlock()
 	if m.script != nil {
 		go turn.play(m.script(prompt))
 		return turn.events, nil
@@ -153,12 +186,81 @@ func (m *MockTransport) SendPrompt(ctx context.Context, prompt string) (<-chan s
 	return turn.events, nil
 }
 
-// Close records the close.
+// Interrupt records the interrupt and, unless interrupts are ignored or
+// failing, ends every open turn as an agent honoring the interrupt would.
+func (m *MockTransport) Interrupt(context.Context) error {
+	m.mu.Lock()
+	m.interruptCount++
+	if m.interruptErr != nil || m.ignoreInterrupts {
+		m.mu.Unlock()
+		return m.interruptErr
+	}
+	m.mu.Unlock()
+	m.FinishOpenTurns()
+	return nil
+}
+
+// Done delivers the simulated subprocess exit.
+func (m *MockTransport) Done() <-chan error {
+	return m.done
+}
+
+// PGID returns the configured process group ID (0 by default).
+func (m *MockTransport) PGID() int {
+	return m.pgid
+}
+
+// Close records the close, ends every open turn, and reports a clean exit.
 func (m *MockTransport) Close() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.closeCount++
-	return nil
+	m.mu.Unlock()
+	m.exit(nil)
+	m.FinishOpenTurns()
+	return m.closeErr
+}
+
+// Crash simulates an unexpected subprocess exit with err: the exit is
+// reported on Done, then every open turn's event stream ends.
+func (m *MockTransport) Crash(err error) {
+	m.exit(err)
+	m.FinishOpenTurns()
+}
+
+// FinishOpenTurns ends every turn opened so far.
+func (m *MockTransport) FinishOpenTurns() {
+	m.mu.Lock()
+	open := m.open
+	m.open = nil
+	m.mu.Unlock()
+	for _, t := range open {
+		t.Finish()
+	}
+}
+
+func (m *MockTransport) exit(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.exited {
+		return
+	}
+	m.exited = true
+	m.done <- err
+	close(m.done)
+}
+
+// Exited reports whether the simulated subprocess has exited.
+func (m *MockTransport) Exited() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.exited
+}
+
+// InterruptCount returns how many times Interrupt was called.
+func (m *MockTransport) InterruptCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.interruptCount
 }
 
 // StartConfig returns the config passed to Start and whether Start ran.
@@ -201,23 +303,38 @@ func (m *MockTransport) NextTurn(t testing.TB) *MockTurn {
 	}
 }
 
+// ErrTurnFinished is returned by Emit once the turn has been finished.
+var ErrTurnFinished = errors.New("sessiontest: turn finished")
+
 // MockTurn is one in-flight turn of a MockTransport.
 type MockTurn struct {
 	Prompt string
 
-	ctx       context.Context
-	events    chan session.SDKEvent
-	closeOnce sync.Once
+	ctx      context.Context
+	events   chan session.SDKEvent
+	stop     chan struct{}
+	stopOnce sync.Once
+
+	sendMu   sync.Mutex // serializes sends with closing events
+	finished bool
 }
 
 // Emit delivers ev to the session, blocking until it is consumed. It returns
-// the context error if the turn was cancelled first.
+// the context error if the turn was cancelled first, or ErrTurnFinished if
+// the turn was finished.
 func (t *MockTurn) Emit(ev session.SDKEvent) error {
+	t.sendMu.Lock()
+	defer t.sendMu.Unlock()
+	if t.finished {
+		return ErrTurnFinished
+	}
 	select {
 	case t.events <- ev:
 		return nil
 	case <-t.ctx.Done():
 		return t.ctx.Err()
+	case <-t.stop:
+		return ErrTurnFinished
 	}
 }
 
@@ -232,8 +349,15 @@ func (t *MockTurn) MustEmit(tb testing.TB, events ...session.SDKEvent) {
 }
 
 // Finish closes the turn's event channel, simulating the end of the turn.
+// It is safe to call concurrently with Emit and more than once.
 func (t *MockTurn) Finish() {
-	t.closeOnce.Do(func() { close(t.events) })
+	t.stopOnce.Do(func() { close(t.stop) })
+	t.sendMu.Lock()
+	defer t.sendMu.Unlock()
+	if !t.finished {
+		t.finished = true
+		close(t.events)
+	}
 }
 
 // Context returns the turn context handed to SendPrompt.
